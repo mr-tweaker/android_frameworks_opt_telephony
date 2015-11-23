@@ -110,6 +110,7 @@ public abstract class PhoneBase extends Handler implements Phone {
                 if (intent.getAction().equals(ImsManager.ACTION_IMS_SERVICE_UP)) {
                     mImsServiceReady = true;
                     updateImsPhone();
+                    ImsManager.updateImsServiceConfig(mContext, mPhoneId, false);
                 } else if (intent.getAction().equals(ImsManager.ACTION_IMS_SERVICE_DOWN)) {
                     mImsServiceReady = false;
                     updateImsPhone();
@@ -515,6 +516,7 @@ public abstract class PhoneBase extends Handler implements Phone {
             if (imsManager != null && imsManager.isServiceAvailable()) {
                 mImsServiceReady = true;
                 updateImsPhone();
+                ImsManager.updateImsServiceConfig(mContext, mPhoneId, false);
             }
         }
     }
@@ -810,6 +812,9 @@ public abstract class PhoneBase extends Handler implements Phone {
        mHandoverRegistrants.notifyRegistrants(ar);
     }
 
+    protected void setIsInEmergencyCall() {
+    }
+
     public void migrateFrom(PhoneBase from) {
         migrate(mHandoverRegistrants, from.mHandoverRegistrants);
         migrate(mPreciseCallStateRegistrants, from.mPreciseCallStateRegistrants);
@@ -821,6 +826,9 @@ public abstract class PhoneBase extends Handler implements Phone {
         migrate(mMmiRegistrants, from.mMmiRegistrants);
         migrate(mUnknownConnectionRegistrants, from.mUnknownConnectionRegistrants);
         migrate(mSuppServiceFailedRegistrants, from.mSuppServiceFailedRegistrants);
+        if (from.isInEmergencyCall()) {
+            setIsInEmergencyCall();
+        }
     }
 
     public void migrate(RegistrantList to, RegistrantList from) {
@@ -1031,30 +1039,23 @@ public abstract class PhoneBase extends Handler implements Phone {
                 // send the setting on error
             }
         }
-        if (doAutomatic) {
-            // wrap the response message in our own message along with
-            // an empty string (to indicate automatic selection) for the
-            // operator's id.
-            NetworkSelectMessage nsm = new NetworkSelectMessage();
-            nsm.message = response;
-            nsm.operatorNumeric = "";
-            nsm.operatorAlphaLong = "";
-            nsm.operatorAlphaShort = "";
 
+        // wrap the response message in our own message along with
+        // an empty string (to indicate automatic selection) for the
+        // operator's id.
+        NetworkSelectMessage nsm = new NetworkSelectMessage();
+        nsm.message = response;
+        nsm.operatorNumeric = "";
+        nsm.operatorAlphaLong = "";
+        nsm.operatorAlphaShort = "";
+
+        if (doAutomatic) {
             Message msg = obtainMessage(EVENT_SET_NETWORK_AUTOMATIC_COMPLETE, nsm);
             mCi.setNetworkSelectionModeAutomatic(msg);
-
-            updateSavedNetworkOperator(nsm);
         } else {
             Rlog.d(LOG_TAG, "setNetworkSelectionModeAutomatic - already auto, ignoring");
-            // since the Network selection mode is already set to
-            // automatic, sendresponse with the result considering
-            // it as successful for those expecting it.
-            if (response != null) {
-                AsyncResult.forMessage(response, null, null);
-                response.sendToTarget();
-            }
-
+            ar.userObj = nsm;
+            handleSetSelectNetwork(ar);
         }
     }
 
@@ -1064,7 +1065,8 @@ public abstract class PhoneBase extends Handler implements Phone {
     }
 
     @Override
-    public void selectNetworkManually(OperatorInfo network, Message response) {
+    public void selectNetworkManually(OperatorInfo network, boolean persistSelection,
+            Message response) {
         // wrap the response message in our own message along with
         // the operator's id.
         NetworkSelectMessage nsm = new NetworkSelectMessage();
@@ -1081,7 +1083,11 @@ public abstract class PhoneBase extends Handler implements Phone {
                     + "+" + network.getRadioTech(), msg);
         }
 
-        updateSavedNetworkOperator(nsm);
+        if (persistSelection) {
+            updateSavedNetworkOperator(nsm);
+        } else {
+            clearSavedNetworkSelection();
+        }
     }
 
     /**
@@ -1156,6 +1162,17 @@ public abstract class PhoneBase extends Handler implements Phone {
     }
 
     /**
+     * Clears the saved network selection.
+     */
+    private void clearSavedNetworkSelection() {
+        // open the shared preferences and search with our key.
+        PreferenceManager.getDefaultSharedPreferences(getContext()).edit().
+                remove(NETWORK_SELECTION_KEY + getSubId()).
+                remove(NETWORK_SELECTION_NAME_KEY + getSubId()).
+                remove(NETWORK_SELECTION_SHORT_KEY + getSubId()).commit();
+    }
+
+    /**
      * Method to restore the previously saved operator id, or reset to
      * automatic selection, all depending upon the value in the shared
      * preferences.
@@ -1168,7 +1185,23 @@ public abstract class PhoneBase extends Handler implements Phone {
         if (networkSelection == null || TextUtils.isEmpty(networkSelection.getOperatorNumeric())) {
             setNetworkSelectionModeAutomatic(response);
         } else {
-            selectNetworkManually(networkSelection, response);
+            selectNetworkManually(networkSelection, true, response);
+        }
+    }
+
+    /**
+     * Saves CLIR setting so that we can re-apply it as necessary
+     * (in case the RIL resets it across reboots).
+     */
+    public void saveClirSetting(int commandInterfaceCLIRMode) {
+        // Open the shared preferences editor, and write the value.
+        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(getContext());
+        SharedPreferences.Editor editor = sp.edit();
+        editor.putInt(CLIR_KEY + getPhoneId(), commandInterfaceCLIRMode);
+
+        // Commit and log the result.
+        if (!editor.commit()) {
+            Rlog.e(LOG_TAG, "Failed to commit CLIR preference");
         }
     }
 
@@ -2499,6 +2532,11 @@ public abstract class PhoneBase extends Handler implements Phone {
     @Override
     public void shutdownRadio() {
         getServiceStateTracker().requestShutdown();
+    }
+
+    @Override
+    public boolean isShuttingDown() {
+        return getServiceStateTracker().isDeviceShuttingDown();
     }
 
     @Override
